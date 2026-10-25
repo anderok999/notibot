@@ -6,9 +6,11 @@ import time
 import schedule
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import telebot
+from telebot import types
 from bs4 import BeautifulSoup
 from google import genai
 
+# Carga de credenciales desde variables de entorno
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -20,10 +22,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# --- SERVIDOR SILENCIOSO PARA MANTENER RENDER DESPIERTO ---
+# --- SERVIDOR SILENCIOSO PARA KEEP-ALIVE DE RENDER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Esta respuesta SOLO la lee GitHub Actions, NUNCA va a Telegram
+        # Esta respuesta la consulta GitHub Actions para mantener el servidor activo
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot activo 24/7")
@@ -33,7 +35,7 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- FUNCIONES DE SCRAPING ---
+# --- FUNCIONES DE SCRAPING CON FECHAS (ÚLTIMAS 24H) ---
 
 def extraer_noticias_general():
     noticias = []
@@ -130,10 +132,18 @@ def procesar_con_ia(noticias_raw, tipo="general"):
             
     return "Error al generar el reporte con la IA."
 
-# --- ENVÍO DE BOLETINES PROGRAMADOS Y COMANDOS ---
+# --- MENÚ INTERACTIVO EN TELEGRAM ---
+
+def crear_menu_principal():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    btn_boletin = types.KeyboardButton("📰 Boletín del Día")
+    btn_seguridad = types.KeyboardButton("🚨 Noticias de Seguridad")
+    markup.add(btn_boletin, btn_seguridad)
+    return markup
+
+# --- ENVÍO PROGRAMADO AUTOMÁTICO ---
 
 def enviar_boletin_automatico():
-    """Esta función se ejecuta sola 3 veces al día"""
     print("⏰ Ejecutando envío automático de boletín diario...")
     noticias = extraer_noticias_general()
     if noticias:
@@ -141,7 +151,6 @@ def enviar_boletin_automatico():
         bot.send_message(CHAT_ID, boletin, parse_mode="HTML", disable_web_page_preview=True)
 
 def tareas_programadas():
-    """Configuración de horarios automáticos en hora local del servidor (BOT / UTC-4)"""
     schedule.every().day.at("07:00").do(enviar_boletin_automatico)
     schedule.every().day.at("12:00").do(enviar_boletin_automatico)
     schedule.every().day.at("19:00").do(enviar_boletin_automatico)
@@ -150,7 +159,17 @@ def tareas_programadas():
         schedule.run_pending()
         time.sleep(30)
 
-@bot.message_handler(commands=['seguridad', 'policia'])
+# --- ESCUCHA DE COMANDOS Y BOTONES EN TELEGRAM ---
+
+@bot.message_handler(commands=['start', 'menu'])
+def enviar_bienvenida(message):
+    texto_bienvenida = (
+        "<b>🇧🇴 ¡Bienvenido al Bot de Noticias de Bolivia! 🇧🇴</b>\n\n"
+        "Selecciona una opción en el menú del teclado para obtener noticias al instante:"
+    )
+    bot.send_message(message.chat.id, texto_bienvenida, parse_mode="HTML", reply_markup=crear_menu_principal())
+
+@bot.message_handler(func=lambda m: m.text == "🚨 Noticias de Seguridad" or m.text in ['/seguridad', '/policia'])
 def responder_seguridad(message):
     bot.reply_to(message, "🔍 Buscando y analizando los reportes policiales y de seguridad más recientes...")
     noticias = extraer_noticias_seguridad()
@@ -160,7 +179,7 @@ def responder_seguridad(message):
     else:
         bot.send_message(message.chat.id, "No se encontraron reportes policiales recientes en este momento.")
 
-@bot.message_handler(commands=['boletin', 'start'])
+@bot.message_handler(func=lambda m: m.text == "📰 Boletín del Día" or m.text == '/boletin')
 def responder_boletin(message):
     bot.reply_to(message, "📰 Generando el boletín con las noticias principales...")
     noticias = extraer_noticias_general()
@@ -170,13 +189,15 @@ def responder_boletin(message):
     else:
         bot.send_message(message.chat.id, "No se encontraron noticias recientes.")
 
+# --- INICIALIZACIÓN DE HILOS ---
+
 if __name__ == "__main__":
-    # 1. Hilo secundario: Servidor de salud para Keep-Alive de Render (silencioso)
+    # Servidor web en segundo plano (Keep-Alive)
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    # 2. Hilo secundario: Programador de horarios automáticos (7:00, 12:00, 19:00)
+    # Programador de horarios en segundo plano (7:00, 12:00, 19:00)
     threading.Thread(target=tareas_programadas, daemon=True).start()
     
-    print("🤖 Bot iniciado, escuchando comandos e hilos activos...")
-    # 3. Hilo principal: Escucha constante de comandos de Telegram (/seguridad, etc.)
+    print("🤖 Bot activo, escuchando comandos en Telegram...")
+    # Bucle principal de polling para escuchar comandos y botones
     bot.infinity_polling()
