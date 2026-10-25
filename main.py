@@ -2,12 +2,13 @@ import os
 import requests
 import html
 import threading
+import time
+import schedule
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import telebot
 from bs4 import BeautifulSoup
 from google import genai
 
-# Carga de credenciales desde variables de entorno
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -19,9 +20,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Servidor HTTP ficticio para mantener activo Render
+# --- SERVIDOR SILENCIOSO PARA MANTENER RENDER DESPIERTO ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # Esta respuesta SOLO la lee GitHub Actions, NUNCA va a Telegram
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot activo 24/7")
@@ -31,7 +33,7 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- FUNCIONES DE SCRAPING CON FECHAS ---
+# --- FUNCIONES DE SCRAPING ---
 
 def extraer_noticias_general():
     noticias = []
@@ -79,7 +81,7 @@ def extraer_noticias_seguridad():
             print(f"Error scraping seguridad: {e}")
     return noticias[:15]
 
-# --- PROCESAMIENTO CON IA (GEMINI) ---
+# --- PROCESAMIENTO IA CON GEMINI ---
 
 def procesar_con_ia(noticias_raw, tipo="general"):
     lista_txt = "\n".join([f"- Título: {t} | Enlace: {l} | Fecha: {f}" for t, l, f in noticias_raw])
@@ -128,7 +130,25 @@ def procesar_con_ia(noticias_raw, tipo="general"):
             
     return "Error al generar el reporte con la IA."
 
-# --- COMANDOS EN TELEGRAM ---
+# --- ENVÍO DE BOLETINES PROGRAMADOS Y COMANDOS ---
+
+def enviar_boletin_automatico():
+    """Esta función se ejecuta sola 3 veces al día"""
+    print("⏰ Ejecutando envío automático de boletín diario...")
+    noticias = extraer_noticias_general()
+    if noticias:
+        boletin = procesar_con_ia(noticias, tipo="general")
+        bot.send_message(CHAT_ID, boletin, parse_mode="HTML", disable_web_page_preview=True)
+
+def tareas_programadas():
+    """Configuración de horarios automáticos en hora local del servidor (BOT / UTC-4)"""
+    schedule.every().day.at("07:00").do(enviar_boletin_automatico)
+    schedule.every().day.at("12:00").do(enviar_boletin_automatico)
+    schedule.every().day.at("19:00").do(enviar_boletin_automatico)
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
 
 @bot.message_handler(commands=['seguridad', 'policia'])
 def responder_seguridad(message):
@@ -151,7 +171,12 @@ def responder_boletin(message):
         bot.send_message(message.chat.id, "No se encontraron noticias recientes.")
 
 if __name__ == "__main__":
-    # Inicia el servidor de salud en un hilo secundario
+    # 1. Hilo secundario: Servidor de salud para Keep-Alive de Render (silencioso)
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("🤖 Bot iniciado y escuchando en Telegram...")
+    
+    # 2. Hilo secundario: Programador de horarios automáticos (7:00, 12:00, 19:00)
+    threading.Thread(target=tareas_programadas, daemon=True).start()
+    
+    print("🤖 Bot iniciado, escuchando comandos e hilos activos...")
+    # 3. Hilo principal: Escucha constante de comandos de Telegram (/seguridad, etc.)
     bot.infinity_polling()
