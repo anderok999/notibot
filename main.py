@@ -1,203 +1,283 @@
-import os
-import requests
-import html
-import threading
-import time
-import schedule
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import telebot
-from telebot import types
-from bs4 import BeautifulSoup
-from google import genai
+"""Punto de entrada de NotiBot.
 
-# Carga de credenciales desde variables de entorno
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CHAT_ID = os.getenv("CHAT_ID")
+Uso:
+    python main.py                 # bot + scheduler + health server
+    python main.py --check         # valida configuración sin secretos
+    python main.py --dry-run       # scraping real, sin enviar a Telegram
+    python main.py --once general  # un envío inmediato y sale
+"""
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-client = genai.Client(api_key=GEMINI_API_KEY)
+from __future__ import annotations
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+import argparse
+import contextlib
+import json
+import logging
+import signal
+import sys
+from collections.abc import Sequence
+from dataclasses import replace
 
-# --- SERVIDOR SILENCIOSO PARA KEEP-ALIVE DE RENDER ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Esta respuesta la consulta GitHub Actions para mantener el servidor activo
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot activo 24/7")
+from notibot.ai import AIClient
+from notibot.bot import NotiBot
+from notibot.config import ConfigError, Settings
+from notibot.formatting import build_messages
+from notibot.health import HealthServer
+from notibot.pipeline import NewsPipeline
+from notibot.scheduler import BotScheduler
+from notibot.sources import RedunoSource, UnitelSource
+from notibot.sources.base import BaseSource
+from notibot.storage import Storage
+from notibot.utils import format_datetime
 
-def run_health_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+log = logging.getLogger(__name__)
 
-# --- FUNCIONES DE SCRAPING CON FECHAS (ÚLTIMAS 24H) ---
 
-def extraer_noticias_general():
-    noticias = []
-    fuentes = ["https://unitel.bo/noticias", "https://www.reduno.com.bo/noticias"]
-    for url_fuente in fuentes:
-        try:
-            res = requests.get(url_fuente, headers=HEADERS, timeout=10)
-            soup = BeautifulSoup(res.text, "html.parser")
-            for a in soup.find_all("a", href=True):
-                titulo = a.get_text(strip=True)
-                url = a["href"]
-                time_tag = a.find_parent().find("time") if a.find_parent() else None
-                fecha_str = time_tag.get_text(strip=True) if time_tag else "Hoy (Últimas 24h)"
-                
-                if len(titulo) > 25 and ("noticias" in url or "unitel.bo" in url or "reduno" in url):
-                    if not url.startswith("http"):
-                        domain = "https://unitel.bo" if "unitel" in url_fuente else "https://www.reduno.com.bo"
-                        url = f"{domain}{url}"
-                    if (titulo, url) not in [(t, u) for t, u, f in noticias]:
-                        noticias.append((titulo, url, fecha_str))
-        except Exception as e:
-            print(f"Error scraping general: {e}")
-    return noticias[:15]
-
-def extraer_noticias_seguridad():
-    noticias = []
-    fuentes_seguridad = ["https://unitel.bo/noticias/seguridad", "https://www.reduno.com.bo/noticias/seguridad"]
-    for url_fuente in fuentes_seguridad:
-        try:
-            res = requests.get(url_fuente, headers=HEADERS, timeout=10)
-            soup = BeautifulSoup(res.text, "html.parser")
-            for a in soup.find_all("a", href=True):
-                titulo = a.get_text(strip=True)
-                url = a["href"]
-                time_tag = a.find_parent().find("time") if a.find_parent() else None
-                fecha_str = time_tag.get_text(strip=True) if time_tag else "Hoy"
-                
-                if len(titulo) > 20:
-                    if not url.startswith("http"):
-                        domain = "https://unitel.bo" if "unitel" in url_fuente else "https://www.reduno.com.bo"
-                        url = f"{domain}{url}"
-                    if (titulo, url) not in [(t, u) for t, u, f in noticias]:
-                        noticias.append((titulo, url, fecha_str))
-        except Exception as e:
-            print(f"Error scraping seguridad: {e}")
-    return noticias[:15]
-
-# --- PROCESAMIENTO IA CON GEMINI ---
-
-def procesar_con_ia(noticias_raw, tipo="general"):
-    lista_txt = "\n".join([f"- Título: {t} | Enlace: {l} | Fecha: {f}" for t, l, f in noticias_raw])
-    
-    if tipo == "seguridad":
-        instrucciones_tipo = """
-        Selecciona las 5 noticias más relevantes enfocadas EXCLUSIVAMENTE en la POLICÍA BOLIVIANA, operativos, reportes policiales, seguridad ciudadana o casos judiciales recientes.
-        Encabezado: <b>🚨 REPORTES DE SEGURIDAD Y POLICÍA BOLIVIANA 🚨</b>
-        """
-    else:
-        instrucciones_tipo = """
-        Selecciona las 5 noticias generales MÁS IMPORTANTES y de mayor impacto nacional de las últimas 24 horas.
-        Encabezado: <b>🇧🇴 BOLETÍN INFORMATIVO DE BOLIVIA 🇧🇴</b>
-        """
-
-    prompt = f"""
-    Eres un periodista y editor de noticias experto en Bolivia.
-    Analiza la siguiente lista de titulares recientes de Unitel y Red Uno:
-
-    {lista_txt}
-
-    Instrucciones:
-    1. {instrucciones_tipo}
-    2. Solo incluye noticias publicadas recientemente (dentro de las últimas 24 horas).
-    3. Para cada noticia redacta:
-       - Título descriptivo en negrita.
-       - Fecha/Hora de publicación indicada.
-       - Breve resumen informativo de 1 a 2 oraciones.
-       - Enlace directo a la fuente.
-    4. Usa únicamente etiquetas HTML válidas para Telegram (<b>, <i>, <a href="...">). No uses Markdown.
-
-    Formato por cada noticia:
-    1. <b>[Título de la Noticia]</b>
-    📅 <i>Fecha: [Fecha o 'Hoy']</i>
-    [Resumen informativo]
-    👉 <a href="[URL_ORIGINAL]">Leer noticia completa</a>
-    """
-
-    modelos = ["gemini-3.8-flash", "gemini-2.5-flash"]
-    for modelo in modelos:
-        try:
-            response = client.models.generate_content(model=modelo, contents=prompt)
-            return response.text
-        except Exception:
-            continue
-            
-    return "Error al generar el reporte con la IA."
-
-# --- MENÚ INTERACTIVO EN TELEGRAM ---
-
-def crear_menu_principal():
-    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    btn_boletin = types.KeyboardButton("📰 Boletín del Día")
-    btn_seguridad = types.KeyboardButton("🚨 Noticias de Seguridad")
-    markup.add(btn_boletin, btn_seguridad)
-    return markup
-
-# --- ENVÍO PROGRAMADO AUTOMÁTICO ---
-
-def enviar_boletin_automatico():
-    print("⏰ Ejecutando envío automático de boletín diario...")
-    noticias = extraer_noticias_general()
-    if noticias:
-        boletin = procesar_con_ia(noticias, tipo="general")
-        bot.send_message(CHAT_ID, boletin, parse_mode="HTML", disable_web_page_preview=True)
-
-def tareas_programadas():
-    schedule.every().day.at("07:00").do(enviar_boletin_automatico)
-    schedule.every().day.at("12:00").do(enviar_boletin_automatico)
-    schedule.every().day.at("19:00").do(enviar_boletin_automatico)
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
-
-# --- ESCUCHA DE COMANDOS Y BOTONES EN TELEGRAM ---
-
-@bot.message_handler(commands=['start', 'menu'])
-def enviar_bienvenida(message):
-    texto_bienvenida = (
-        "<b>🇧🇴 ¡Bienvenido al Bot de Noticias de Bolivia! 🇧🇴</b>\n\n"
-        "Selecciona una opción en el menú del teclado para obtener noticias al instante:"
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
-    bot.send_message(message.chat.id, texto_bienvenida, parse_mode="HTML", reply_markup=crear_menu_principal())
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("telebot").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.INFO)
 
-@bot.message_handler(func=lambda m: m.text == "🚨 Noticias de Seguridad" or m.text in ['/seguridad', '/policia'])
-def responder_seguridad(message):
-    bot.reply_to(message, "🔍 Buscando y analizando los reportes policiales y de seguridad más recientes...")
-    noticias = extraer_noticias_seguridad()
-    if noticias:
-        reporte = procesar_con_ia(noticias, tipo="seguridad")
-        bot.send_message(message.chat.id, reporte, parse_mode="HTML", disable_web_page_preview=True)
-    else:
-        bot.send_message(message.chat.id, "No se encontraron reportes policiales recientes en este momento.")
 
-@bot.message_handler(func=lambda m: m.text == "📰 Boletín del Día" or m.text == '/boletin')
-def responder_boletin(message):
-    bot.reply_to(message, "📰 Generando el boletín con las noticias principales...")
-    noticias = extraer_noticias_general()
-    if noticias:
-        boletin = procesar_con_ia(noticias, tipo="general")
-        bot.send_message(message.chat.id, boletin, parse_mode="HTML", disable_web_page_preview=True)
-    else:
-        bot.send_message(message.chat.id, "No se encontraron noticias recientes.")
+def build_sources(settings: Settings) -> dict[str, BaseSource]:
+    return {
+        "unitel": UnitelSource(
+            timeout=settings.request_timeout,
+            max_workers=4,
+        ),
+        "reduno": RedunoSource(
+            timeout=settings.request_timeout,
+            max_workers=4,
+        ),
+    }
 
-# --- INICIALIZACIÓN DE HILOS ---
+
+def build_storage(settings: Settings) -> Storage:
+    settings.ensure_dirs()
+    return Storage(settings.data_dir / "notibot.db")
+
+
+def build_ai(settings: Settings) -> AIClient | None:
+    if not settings.gemini_api_key:
+        log.warning("GEMINI_API_KEY no configurada; se usará resumen automático")
+        return None
+    try:
+        return AIClient(settings.gemini_api_key, settings.gemini_models)
+    except Exception:  # noqa: BLE001 - el bot puede seguir con fallback
+        log.exception("No se pudo inicializar Gemini; se usará fallback")
+        return None
+
+
+def close_sources(sources: dict[str, BaseSource]) -> None:
+    for source in sources.values():
+        with contextlib.suppress(Exception):
+            source.close()
+
+
+def run_check(settings: Settings) -> int:
+    print(json.dumps(settings.summary(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_dry(args: argparse.Namespace, settings: Settings) -> int:
+    if args.limit is not None:
+        settings = replace(settings, max_articles_per_source=args.limit)
+
+    settings.ensure_dirs()
+    sources = build_sources(settings)
+    storage = build_storage(settings)
+    ai: AIClient | None = None
+    if args.with_ai:
+        if not settings.gemini_api_key:
+            log.error("--with-ai requiere GEMINI_API_KEY")
+            close_sources(sources)
+            return 2
+        ai = build_ai(settings)
+
+    pipeline = NewsPipeline(settings, sources, storage, ai)
+    try:
+        items, summaries, model = pipeline.build(args.kind, automatic=False)
+    finally:
+        close_sources(sources)
+
+    if not items:
+        print("No se encontraron noticias.")
+        return 1
+
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item.source] = counts.get(item.source, 0) + 1
+
+    print("Modo dry-run: no se envió nada a Telegram.")
+    print(
+        f"Tipo: {args.kind} | Noticias: {len(items)} | "
+        f"Fuentes: {counts} | Modelo: {model}"
+    )
+
+    for index, (item, summary) in enumerate(zip(items, summaries, strict=False), start=1):
+        estimated = " (fecha estimada)" if item.date_estimated else ""
+        print(
+            f"\n{index}. [{item.source}] "
+            f"{format_datetime(item.published_at, settings.timezone)}{estimated}"
+        )
+        print(f"   {item.title}")
+        print(f"   {item.url}")
+        print(f"   {summary}")
+
+    messages = build_messages(
+        items,
+        summaries,
+        args.kind,
+        settings.timezone,
+        model,
+    )
+    print("\n--- Mensajes que se enviarían ---")
+    for index, message in enumerate(messages, start=1):
+        print(
+            f"\n[Mensaje {index} · {len(message)} caracteres]\n{message}"
+        )
+    return 0
+
+
+def run_once(kind: str, settings: Settings) -> int:
+    settings.ensure_dirs()
+    sources = build_sources(settings)
+    storage = build_storage(settings)
+    ai = build_ai(settings)
+    pipeline = NewsPipeline(settings, sources, storage, ai)
+    bot = NotiBot(settings, pipeline, storage)
+    try:
+        bot.connect()
+        ok = bot.run_automatic(kind)
+        print("Envío completado." if ok else "No se pudo completar el envío.")
+        return 0 if ok else 1
+    finally:
+        close_sources(sources)
+
+
+def run_service(settings: Settings) -> int:
+    settings.ensure_dirs()
+    sources = build_sources(settings)
+    storage = build_storage(settings)
+    storage.prune_seen()
+    ai = build_ai(settings)
+    pipeline = NewsPipeline(settings, sources, storage, ai)
+    bot = NotiBot(settings, pipeline, storage)
+    scheduler = BotScheduler(settings, bot.run_automatic)
+    bot.scheduler_status = lambda: scheduler.running
+    bot.next_runs_provider = scheduler.next_runs
+    health = HealthServer(settings.port, bot.state)
+
+    stopping = False
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        log.info("Señal %s recibida; cerrando NotiBot...", signum)
+        bot.stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            signal.signal(sig, handle_signal)
+
+    try:
+        bot.connect()
+        scheduler.start()
+        health.start()
+        log.info("NotiBot listo; esperando mensajes de Telegram...")
+        bot.poll()
+    finally:
+        bot.stop()
+        scheduler.shutdown()
+        health.stop()
+        close_sources(sources)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="NotiBot: boletín de noticias bolivianas por Telegram"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="valida la configuración y muestra un resumen sin secretos",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="hace scraping real y muestra el boletín sin enviarlo",
+    )
+    parser.add_argument(
+        "--with-ai",
+        action="store_true",
+        help="en --dry-run, usa Gemini si GEMINI_API_KEY está disponible",
+    )
+    parser.add_argument(
+        "--kind",
+        choices=["general", "seguridad"],
+        default="general",
+        help="tipo de boletín para --dry-run",
+    )
+    parser.add_argument(
+        "--once",
+        choices=["general", "seguridad"],
+        help="envía un boletín inmediato a CHAT_ID/CHAT_IDS y termina",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="máximo de artículos a inspeccionar por fuente en --dry-run",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        with contextlib.suppress(Exception):
+            sys.stdout.reconfigure(encoding="utf-8")
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.dry_run and args.once:
+        parser.error("--dry-run y --once son mutuamente excluyentes")
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit debe ser mayor que 0")
+
+    try:
+        settings = Settings.from_env(
+            require_credentials=not (args.dry_run or args.check)
+        )
+    except ConfigError as exc:
+        print(f"ERROR DE CONFIGURACIÓN: {exc}", file=sys.stderr)
+        return 2
+
+    setup_logging(settings.log_level)
+
+    try:
+        if args.check:
+            return run_check(settings)
+        if args.dry_run:
+            return run_dry(args, settings)
+        if args.once:
+            return run_once(args.once, settings)
+        return run_service(settings)
+    except KeyboardInterrupt:
+        log.info("Interrumpido por el usuario")
+        return 0
+    except Exception:  # noqa: BLE001 - error fatal de arranque
+        log.exception("Error fatal de NotiBot")
+        return 1
+
 
 if __name__ == "__main__":
-    # Servidor web en segundo plano (Keep-Alive)
-    threading.Thread(target=run_health_server, daemon=True).start()
-    
-    # Programador de horarios en segundo plano (7:00, 12:00, 19:00)
-    threading.Thread(target=tareas_programadas, daemon=True).start()
-    
-    print("🤖 Bot activo, escuchando comandos en Telegram...")
-    # Bucle principal de polling para escuchar comandos y botones
-    bot.infinity_polling()
+    raise SystemExit(main())

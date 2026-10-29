@@ -1,0 +1,31 @@
+# Referencia para un Blueprint de Render.
+# El servicio existente puede haberse creado manualmente; en ese caso
+# configura estos mismos valores en el dashboard.
+
+services:
+  - type: web
+    name: notibot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+        value: ""
+      - key: TIMEZONE
+        value: America/La_Paz
+      - key: SCHEDULE_TIMES
+        value: 07:00,12:00,19:00
+      - key: GEMINI_MODELS
+        value: gemini-2.5-flash,gemini-2.0-flash
+      - key: DATA_DIR
+        value: data

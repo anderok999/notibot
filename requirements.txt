@@ -1,5 +1,7 @@
-pyTelegramBotAPI
-google-genai
-beautifulsoup4
-requests
-schedule
+APScheduler==3.11.3
+beautifulsoup4==4.15.0
+google-genai==2.33.0
+pyTelegramBotAPI==4.37.1
+python-dotenv==1.2.4
+requests==2.34.2
+tzdata==2026.6
