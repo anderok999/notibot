@@ -41,6 +41,7 @@ class NotiBot:
         self.scheduler_status: Callable[[], bool] = lambda: False
         self.next_runs_provider: Callable[[], dict[str, str]] = lambda: {}
         self._last_request: dict[int, float] = {}
+        self._stopping = False
         self._register_handlers()
 
     # ------------------------------------------------------------------
@@ -69,15 +70,40 @@ class NotiBot:
             log.warning("No se pudieron registrar los comandos: %s", exc)
 
     def poll(self) -> None:
-        self.bot.infinity_polling(
-            timeout=30,
-            long_polling_timeout=30,
-            skip_pending=True,
-            allowed_updates=["message"],
-            logger_level=logging.WARNING,
-        )
+        while not self._stopping:
+            try:
+                self.bot.infinity_polling(
+                    timeout=30,
+                    long_polling_timeout=30,
+                    skip_pending=True,
+                    allowed_updates=["message"],
+                    logger_level=logging.WARNING,
+                )
+                return
+            except ApiTelegramException as exc:
+                if exc.error_code == 409:
+                    log.warning(
+                        "Otra instancia del bot está usando el token (409). "
+                        "Reintentando en 10 segundos..."
+                    )
+                else:
+                    log.exception(
+                        "Telegram rechazó el polling; reintentando en 10 segundos"
+                    )
+                self._sleep_unless_stopping(10)
+            except Exception:  # noqa: BLE001 - el bot debe seguir vivo
+                log.exception(
+                    "Polling interrumpido; reintentando en 10 segundos"
+                )
+                self._sleep_unless_stopping(10)
+
+    def _sleep_unless_stopping(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self._stopping and time.monotonic() < deadline:
+            time.sleep(0.5)
 
     def stop(self) -> None:
+        self._stopping = True
         with contextlib.suppress(Exception):
             self.bot.stop_polling()
 
